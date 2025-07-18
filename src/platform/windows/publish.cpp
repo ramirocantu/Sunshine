@@ -6,7 +6,7 @@
 // winsock2.h must be included before windows.h
 // clang-format off
 #include <winsock2.h>
-#include <windows.h>
+#include <Windows.h>
 // clang-format on
 #include <windns.h>
 #include <winerror.h>

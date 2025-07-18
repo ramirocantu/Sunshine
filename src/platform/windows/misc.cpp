@@ -24,7 +24,7 @@
 #include <timeapi.h>
 #include <userenv.h>
 #include <winsock2.h>
-#include <windows.h>
+#include <Windows.h>
 #include <winuser.h>
 #include <wlanapi.h>
 #include <ws2tcpip.h>
