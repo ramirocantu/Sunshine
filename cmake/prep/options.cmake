@@ -20,6 +20,9 @@ option(SUNSHINE_ENABLE_TRAY "Enable system tray icon. This option will be ignore
 
 option(SUNSHINE_SYSTEM_WAYLAND_PROTOCOLS "Use system installation of wayland-protocols rather than the submodule." OFF)
 
+# Intel VPL (Video Processing Library) support
+option(SUNSHINE_ENABLE_VPL "Enable Intel VPL support for hardware video acceleration." ON)
+
 if(APPLE)
     option(BOOST_USE_STATIC "Use static boost libraries." OFF)
 else()

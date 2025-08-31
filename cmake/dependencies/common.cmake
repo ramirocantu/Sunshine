@@ -4,6 +4,9 @@
 # boost, this should be before Simple-Web-Server as it also depends on boost
 include(dependencies/Boost_Sunshine)
 
+# intel vpl
+include(dependencies/libvpl_Sunshine)
+
 # submodules
 # moonlight common library
 set(ENET_NO_INSTALL ON CACHE BOOL "Don't install any libraries built for enet")

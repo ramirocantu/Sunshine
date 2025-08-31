@@ -96,3 +96,9 @@ if(SUNSHINE_ENABLE_TRAY)
     list(APPEND PLATFORM_TARGET_FILES
             "${CMAKE_SOURCE_DIR}/third-party/tray/src/tray_windows.c")
 endif()
+
+if(SUNSHINE_ENABLE_VPL)
+    add_compile_definitions(SUNSHINE_HAS_VPL)
+    list(APPEND PLATFORM_LIBRARIES ${VPL_LIBRARIES})
+    message(STATUS "Intel VPL support enabled")
+endif()
