@@ -277,6 +277,10 @@ namespace platf::dxgi {
 
     std::unique_ptr<nvenc_encode_device_t> make_nvenc_encode_device(pix_fmt_e pix_fmt) override;
 
+#ifdef SUNSHINE_HAS_VPL
+    std::unique_ptr<vpl_encode_device_t> make_vpl_encode_device(pix_fmt_e pix_fmt);
+#endif
+
     std::atomic<uint32_t> next_image_id;
   };
 

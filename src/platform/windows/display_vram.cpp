@@ -14,6 +14,13 @@ extern "C" {
 #include <libavutil/hwcontext_d3d11va.h>
 }
 
+#ifdef SUNSHINE_HAS_VPL
+#include "vpl/mfx.h"
+#include "vpl/mfxdispatcher.h"
+#include "vpl/mfxvideo.h"
+#define ALIGN16(value) (((value + 15) >> 4) << 4)
+#endif
+
 // lib includes
 #include <AMF/core/Factory.h>
 #include <boost/algorithm/string/predicate.hpp>
@@ -1097,6 +1104,235 @@ namespace platf::dxgi {
     NV_ENC_BUFFER_FORMAT buffer_format = NV_ENC_BUFFER_FORMAT_UNDEFINED;
   };
 
+#ifdef SUNSHINE_HAS_VPL
+  class d3d_vpl_encode_device_t: public vpl_encode_device_t {
+  public:
+    bool init_device(std::shared_ptr<platf::display_t> display, adapter_t::pointer adapter_p, pix_fmt_e pix_fmt) {
+      if (base.init(display, adapter_p, pix_fmt)) {
+        return false;
+      }
+
+      // Initialize VPL encoder
+      if (init_vpl_encoder()) {
+        BOOST_LOG(error) << "Failed to initialize VPL encoder";
+        return false;
+      }
+
+      return true;
+    }
+
+    bool init_encoder(const ::video::config_t &client_config, const ::video::sunshine_colorspace_t &colorspace) override {
+      if (!vpl_session) {
+        return false;
+      }
+
+      // Configure VPL encoding parameters
+      memset(&encode_params, 0, sizeof(encode_params));
+      
+      encode_params.mfx.CodecId = get_vpl_codec_id(client_config.videoFormat);
+      encode_params.mfx.TargetUsage = MFX_TARGETUSAGE_BALANCED;
+      encode_params.mfx.TargetKbps = client_config.bitrate;
+      encode_params.mfx.RateControlMethod = MFX_RATECONTROL_VBR;
+      encode_params.mfx.FrameInfo.FrameRateExtN = client_config.framerate;
+      encode_params.mfx.FrameInfo.FrameRateExtD = 1;
+      encode_params.mfx.FrameInfo.FourCC = get_vpl_fourcc(client_config.dynamicRange);
+      encode_params.mfx.FrameInfo.ChromaFormat = MFX_CHROMAFORMAT_YUV420;
+      encode_params.mfx.FrameInfo.PicStruct = MFX_PICSTRUCT_PROGRESSIVE;
+      encode_params.mfx.FrameInfo.CropX = 0;
+      encode_params.mfx.FrameInfo.CropY = 0;
+      encode_params.mfx.FrameInfo.CropW = client_config.width;
+      encode_params.mfx.FrameInfo.CropH = client_config.height;
+      encode_params.mfx.FrameInfo.Width = ALIGN16(client_config.width);
+      encode_params.mfx.FrameInfo.Height = ALIGN16(client_config.height);
+
+      if (client_config.dynamicRange) {
+        encode_params.mfx.FrameInfo.BitDepthLuma = 10;
+        encode_params.mfx.FrameInfo.BitDepthChroma = 10;
+        encode_params.mfx.FrameInfo.Shift = 1;
+      } else {
+        encode_params.mfx.FrameInfo.BitDepthLuma = 8;
+        encode_params.mfx.FrameInfo.BitDepthChroma = 8;
+      }
+
+      encode_params.IOPattern = MFX_IOPATTERN_IN_VIDEO_MEMORY;
+
+      // Initialize encoder
+      mfxStatus sts = MFXVideoENCODE_Init(vpl_session, &encode_params);
+      if (sts != MFX_ERR_NONE) {
+        BOOST_LOG(error) << "Failed to initialize VPL encoder: " << sts;
+        return false;
+      }
+
+      // Allocate surface pool
+      if (allocate_surface_pool()) {
+        BOOST_LOG(error) << "Failed to allocate VPL surface pool";
+        return false;
+      }
+
+      // Apply colorspace and initialize output
+      base.apply_colorspace(colorspace);
+      return base.init_output(base.output_texture.get(), client_config.width, client_config.height) == 0;
+    }
+
+    int convert(platf::img_t &img_base) override {
+      return base.convert(img_base);
+    }
+
+    ~d3d_vpl_encode_device_t() {
+      cleanup_vpl();
+    }
+
+    int encode_frame(mfxFrameSurface1* surface, mfxBitstream* bitstream) {
+      if (!vpl_session) {
+        return -1;
+      }
+
+      mfxSyncPoint sync_point;
+      mfxStatus sts = MFXVideoENCODE_EncodeFrameAsync(vpl_session, nullptr, surface, bitstream, &sync_point);
+      
+      if (sts == MFX_ERR_MORE_DATA) {
+        return 0; // Need more input frames
+      }
+      
+      if (sts != MFX_ERR_NONE && sts != MFX_WRN_DEVICE_BUSY) {
+        BOOST_LOG(error) << "VPL encode frame failed: " << sts;
+        return -1;
+      }
+
+      // Wait for encoding to complete
+      if (sync_point) {
+        sts = MFXVideoCORE_SyncOperation(vpl_session, sync_point, MFX_INFINITE);
+        if (sts != MFX_ERR_NONE) {
+          BOOST_LOG(error) << "VPL sync operation failed: " << sts;
+          return -1;
+        }
+      }
+
+      return 0;
+    }
+
+  private:
+    int init_vpl_encoder() {
+      mfxStatus sts = MFX_ERR_NONE;
+      
+      // Create VPL loader following Intel documentation
+      vpl_loader = MFXLoad();
+      if (!vpl_loader) {
+        BOOST_LOG(error) << "Failed to create VPL loader";
+        return -1;
+      }
+      
+      // Create configuration
+      mfxConfig cfg = MFXCreateConfig(vpl_loader);
+      if (!cfg) {
+        BOOST_LOG(error) << "Failed to create VPL configuration";
+        cleanup_vpl();
+        return -1;
+      }
+      
+      // Set implementation preference to hardware encoder
+      mfxVariant impl_value;
+      impl_value.Type = MFX_VARIANT_TYPE_U32;
+      impl_value.Data.U32 = MFX_IMPL_TYPE_HARDWARE;
+      sts = MFXSetConfigFilterProperty(cfg, (mfxU8*)"mfxImplDescription.Impl", impl_value);
+      if (sts != MFX_ERR_NONE) {
+        BOOST_LOG(warning) << "Failed to set VPL hardware preference";
+      }
+
+      // Set encoder capability requirement
+      mfxVariant enc_value;
+      enc_value.Type = MFX_VARIANT_TYPE_U32;
+      enc_value.Data.U32 = 1;
+      sts = MFXSetConfigFilterProperty(cfg, (mfxU8*)"mfxImplDescription.mfxEncoderDescription.encoder.CodecID", enc_value);
+      
+      // Create VPL session
+      sts = MFXCreateSession(vpl_loader, 0, &vpl_session);
+      if (sts != MFX_ERR_NONE) {
+        BOOST_LOG(error) << "Failed to create VPL session: " << sts;
+        cleanup_vpl();
+        return -1;
+      }
+      
+      // Setup D3D11 device for VPL
+      sts = MFXVideoCORE_SetHandle(vpl_session, MFX_HANDLE_D3D11_DEVICE, base.device.get());
+      if (sts != MFX_ERR_NONE) {
+        BOOST_LOG(error) << "Failed to set D3D11 device handle for VPL: " << sts;
+        cleanup_vpl();
+        return -1;
+      }
+      
+      BOOST_LOG(info) << "Intel VPL encoder initialized successfully";
+      return 0;
+    }
+
+    void cleanup_vpl() {
+      if (vpl_session) {
+        MFXClose(vpl_session);
+        vpl_session = nullptr;
+      }
+      if (vpl_loader) {
+        MFXUnload(vpl_loader);
+        vpl_loader = nullptr;
+      }
+    }
+
+    mfxU32 get_vpl_codec_id(int video_format) {
+      switch (video_format) {
+        case 0: return MFX_CODEC_AVC;    // H.264
+        case 1: return MFX_CODEC_HEVC;   // HEVC
+        case 2: return MFX_CODEC_AV1;    // AV1
+        default: return MFX_CODEC_AVC;
+      }
+    }
+
+    mfxU32 get_vpl_fourcc(int dynamic_range) {
+      return dynamic_range ? MFX_FOURCC_P010 : MFX_FOURCC_NV12;
+    }
+
+    int allocate_surface_pool() {
+      if (!vpl_session) {
+        return -1;
+      }
+
+      // Query surface requirements
+      mfxFrameAllocRequest allocRequest;
+      memset(&allocRequest, 0, sizeof(allocRequest));
+      
+      mfxStatus sts = MFXVideoENCODE_QueryIOSurf(vpl_session, &encode_params, &allocRequest);
+      if (sts != MFX_ERR_NONE) {
+        BOOST_LOG(error) << "Failed to query VPL surface requirements: " << sts;
+        return -1;
+      }
+
+      // Allocate surfaces using VPL memory management
+      num_surfaces = allocRequest.NumFrameSuggested + 1;
+      surfaces.resize(num_surfaces);
+      
+      for (int i = 0; i < num_surfaces; i++) {
+        sts = MFXMemory_GetSurfaceForEncode(vpl_session, &surfaces[i]);
+        if (sts != MFX_ERR_NONE) {
+          BOOST_LOG(error) << "Failed to allocate VPL surface " << i << ": " << sts;
+          return -1;
+        }
+      }
+
+      BOOST_LOG(info) << "Allocated " << num_surfaces << " VPL encoding surfaces";
+      return 0;
+    }
+
+    void deallocate_surfaces() {
+      surfaces.clear();
+    }
+
+    d3d_base_encode_device base;
+    mfxLoader vpl_loader = nullptr;
+    mfxSession vpl_session = nullptr;
+    mfxVideoParam encode_params = {};
+    std::vector<mfxFrameSurface1*> surfaces;
+    int num_surfaces = 0;
+  };
+#endif
+
   bool set_cursor_texture(device_t::pointer device, gpu_cursor_t &cursor, util::buffer_t<std::uint8_t> &&cursor_img, DXGI_OUTDUPL_POINTER_SHAPE_INFO &shape_info) {
     // This cursor image may not be used
     if (cursor_img.size() == 0) {
@@ -1928,6 +2164,16 @@ namespace platf::dxgi {
     }
     return device;
   }
+
+#ifdef SUNSHINE_HAS_VPL
+  std::unique_ptr<vpl_encode_device_t> display_vram_t::make_vpl_encode_device(pix_fmt_e pix_fmt) {
+    auto device = std::make_unique<d3d_vpl_encode_device_t>();
+    if (!device->init_device(shared_from_this(), adapter.get(), pix_fmt)) {
+      return nullptr;
+    }
+    return device;
+  }
+#endif
 
   int init() {
     BOOST_LOG(info) << "Compiling shaders..."sv;

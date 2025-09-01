@@ -452,6 +452,10 @@ namespace platf {
     nvenc::nvenc_base *nvenc = nullptr;
   };
 
+  struct vpl_encode_device_t: encode_device_t {
+    virtual bool init_encoder(const video::config_t &client_config, const video::sunshine_colorspace_t &colorspace) = 0;
+  };
+
   enum class capture_e : int {
     ok,  ///< Success
     reinit,  ///< Need to reinitialize
@@ -508,6 +512,10 @@ namespace platf {
     }
 
     virtual std::unique_ptr<nvenc_encode_device_t> make_nvenc_encode_device(pix_fmt_e pix_fmt) {
+      return nullptr;
+    }
+
+    virtual std::unique_ptr<vpl_encode_device_t> make_vpl_encode_device(pix_fmt_e pix_fmt) {
       return nullptr;
     }
 
