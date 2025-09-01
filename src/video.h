@@ -100,6 +100,16 @@ namespace video {
     init_buffer_function_t init_avcodec_hardware_input_buffer;
   };
 
+  struct encoder_platform_formats_vpl: encoder_platform_formats_t {
+    encoder_platform_formats_vpl() {
+      dev_type = platf::mem_type_e::dxgi;
+      pix_fmt_8bit = platf::pix_fmt_e::nv12;
+      pix_fmt_10bit = platf::pix_fmt_e::p010;
+      pix_fmt_yuv444_8bit = platf::pix_fmt_e::ayuv;
+      pix_fmt_yuv444_10bit = platf::pix_fmt_e::yuv444p16;
+    }
+  };
+
   struct encoder_platform_formats_nvenc: encoder_platform_formats_t {
     encoder_platform_formats_nvenc(
       const platf::mem_type_e &dev_type,
