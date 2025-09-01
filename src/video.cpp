@@ -425,6 +425,52 @@ namespace video {
     bool force_idr = false;
   };
 
+#ifdef SUNSHINE_HAS_VPL
+  class vpl_encode_session_t: public encode_session_t {
+  public:
+    vpl_encode_session_t(std::unique_ptr<platf::vpl_encode_device_t> encode_device):
+        device(std::move(encode_device)) {
+    }
+
+    int convert(platf::img_t &img) override {
+      if (!device) {
+        return -1;
+      }
+      return device->convert(img);
+    }
+
+    void request_idr_frame() override {
+      force_idr = true;
+    }
+
+    void request_normal_frame() override {
+      force_idr = false;
+    }
+
+    void invalidate_ref_frames(int64_t first_frame, int64_t last_frame) override {
+      // VPL reference frame invalidation would be implemented here
+    }
+
+    // VPL encode frame method following NVENC pattern
+    std::vector<uint8_t> encode_frame(uint64_t frame_index) {
+      if (!device) {
+        return {};
+      }
+      
+      // Placeholder implementation - would use VPL APIs
+      // In real implementation, this would call MFXVideoENCODE_EncodeFrameAsync
+      BOOST_LOG(info) << "VPL encoding frame " << frame_index;
+      
+      // Return empty data for now
+      return {};
+    }
+
+  private:
+    std::unique_ptr<platf::vpl_encode_device_t> device;
+    bool force_idr = false;
+  };
+#endif
+
   struct sync_session_ctx_t {
     safe::signal_t *join_event;
     safe::mail_raw_t::event_t<bool> shutdown_event;
@@ -612,6 +658,104 @@ namespace video {
 #endif
 
 #ifdef _WIN32
+#ifdef SUNSHINE_HAS_VPL
+  encoder_t vpl {
+    "vpl"sv,
+    std::make_unique<encoder_platform_formats_vpl>(),
+    {
+      // Common options - VPL native parameters
+      {
+        {"preset"s, &config::video.qsv.qsv_preset},
+        {"forced_idr"s, 1},
+        {"low_delay_brc"s, 1},
+        {"low_power"s, 1},
+      },
+      {
+        // SDR-specific options
+        {"profile"s, (int) qsv::profile_av1_e::main},
+      },
+      {
+        // HDR-specific options
+        {"profile"s, (int) qsv::profile_av1_e::main},
+      },
+      {
+        // YUV444 SDR-specific options
+        {"profile"s, (int) qsv::profile_av1_e::high},
+      },
+      {
+        // YUV444 HDR-specific options
+        {"profile"s, (int) qsv::profile_av1_e::high},
+      },
+      {},  // Fallback options
+      "vpl_av1"s,
+    },
+    {
+      // Common options
+      {
+        {"preset"s, &config::video.qsv.qsv_preset},
+        {"forced_idr"s, 1},
+        {"low_delay_brc"s, 1},
+        {"low_power"s, 1},
+        {"recovery_point_sei"s, 0},
+        {"pic_timing_sei"s, 0},
+      },
+      {
+        // SDR-specific options
+        {"profile"s, (int) qsv::profile_hevc_e::main},
+      },
+      {
+        // HDR-specific options
+        {"profile"s, (int) qsv::profile_hevc_e::main_10},
+      },
+      {
+        // YUV444 SDR-specific options
+        {"profile"s, (int) qsv::profile_hevc_e::rext},
+      },
+      {
+        // YUV444 HDR-specific options
+        {"profile"s, (int) qsv::profile_hevc_e::rext},
+      },
+      {
+        // Fallback options
+        {"low_power"s, []() {
+           return config::video.qsv.qsv_slow_hevc ? 0 : 1;
+         }},
+      },
+      "vpl_hevc"s,
+    },
+    {
+      // Common options
+      {
+        {"preset"s, &config::video.qsv.qsv_preset},
+        {"cavlc"s, &config::video.qsv.qsv_cavlc},
+        {"forced_idr"s, 1},
+        {"low_delay_brc"s, 1},
+        {"low_power"s, 1},
+        {"recovery_point_sei"s, 0},
+        {"vcm"s, 1},
+        {"pic_timing_sei"s, 0},
+        {"max_dec_frame_buffering"s, 1},
+      },
+      {
+        // SDR-specific options
+        {"profile"s, (int) qsv::profile_h264_e::high},
+      },
+      {},  // HDR-specific options
+      {
+        // YUV444 SDR-specific options
+        {"profile"s, (int) qsv::profile_h264_e::high_444p},
+      },
+      {},  // YUV444 HDR-specific options
+      {
+        // Fallback options
+        {"low_power"s, 0},  // Some old/low-end Intel GPUs don't support low power encoding
+      },
+      "vpl_h264"s,
+    },
+    PARALLEL_ENCODING | CBR_WITH_VBR | RELAXED_COMPLIANCE | NO_RC_BUF_LIMIT | YUV444_SUPPORT
+  };
+#endif
+
   encoder_t quicksync {
     "quicksync"sv,
     std::make_unique<encoder_platform_formats_avcodec>(
@@ -1465,11 +1609,32 @@ namespace video {
     return 0;
   }
 
+#ifdef SUNSHINE_HAS_VPL
+  int encode_vpl(int64_t frame_nr, vpl_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
+    auto encoded_frame = session.encode_frame(frame_nr);
+    if (encoded_frame.empty()) {
+      BOOST_LOG(error) << "VPL returned empty packet";
+      return -1;
+    }
+
+    auto packet = std::make_unique<packet_raw_generic>(std::move(encoded_frame), frame_nr, session.force_idr);
+    packet->channel_data = channel_data;
+    packet->frame_timestamp = frame_timestamp;
+    packets->raise(std::move(packet));
+
+    return 0;
+  }
+#endif
+
   int encode(int64_t frame_nr, encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
     if (auto avcodec_session = dynamic_cast<avcodec_encode_session_t *>(&session)) {
       return encode_avcodec(frame_nr, *avcodec_session, packets, channel_data, frame_timestamp);
     } else if (auto nvenc_session = dynamic_cast<nvenc_encode_session_t *>(&session)) {
       return encode_nvenc(frame_nr, *nvenc_session, packets, channel_data, frame_timestamp);
+#ifdef SUNSHINE_HAS_VPL
+    } else if (auto vpl_session = dynamic_cast<vpl_encode_session_t *>(&session)) {
+      return encode_vpl(frame_nr, *vpl_session, packets, channel_data, frame_timestamp);
+#endif
     }
 
     return -1;
@@ -1856,6 +2021,16 @@ namespace video {
     return std::make_unique<nvenc_encode_session_t>(std::move(encode_device));
   }
 
+#ifdef SUNSHINE_HAS_VPL
+  std::unique_ptr<vpl_encode_session_t> make_vpl_encode_session(const config_t &client_config, std::unique_ptr<platf::vpl_encode_device_t> encode_device) {
+    if (!encode_device->init_encoder(client_config, encode_device->colorspace)) {
+      return nullptr;
+    }
+
+    return std::make_unique<vpl_encode_session_t>(std::move(encode_device));
+  }
+#endif
+
   std::unique_ptr<encode_session_t> make_encode_session(platf::display_t *disp, const encoder_t &encoder, const config_t &config, int width, int height, std::unique_ptr<platf::encode_device_t> encode_device) {
     if (dynamic_cast<platf::avcodec_encode_device_t *>(encode_device.get())) {
       auto avcodec_encode_device = boost::dynamic_pointer_cast<platf::avcodec_encode_device_t>(std::move(encode_device));
@@ -1863,6 +2038,11 @@ namespace video {
     } else if (dynamic_cast<platf::nvenc_encode_device_t *>(encode_device.get())) {
       auto nvenc_encode_device = boost::dynamic_pointer_cast<platf::nvenc_encode_device_t>(std::move(encode_device));
       return make_nvenc_encode_session(config, std::move(nvenc_encode_device));
+#ifdef SUNSHINE_HAS_VPL
+    } else if (dynamic_cast<platf::vpl_encode_device_t *>(encode_device.get())) {
+      auto vpl_encode_device = boost::dynamic_pointer_cast<platf::vpl_encode_device_t>(std::move(encode_device));
+      return make_vpl_encode_session(config, std::move(vpl_encode_device));
+#endif
     }
 
     return nullptr;
@@ -2047,7 +2227,9 @@ namespace video {
       result = disp.make_avcodec_encode_device(pix_fmt);
     } else if (dynamic_cast<const encoder_platform_formats_nvenc *>(encoder.platform_formats.get())) {
       result = disp.make_nvenc_encode_device(pix_fmt);
-    }
+    } else if(dynamic_cast<const encoder_platform_formats_vpl *>(encoder.platform_formats.get())) {
+      result = disp.make_vpl_encode_device(pix_fmt);
+    };
 
     if (result) {
       result->colorspace = colorspace;
