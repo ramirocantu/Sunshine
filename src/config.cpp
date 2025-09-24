@@ -578,6 +578,7 @@ namespace config {
     "ipv4",  // Address family
     platf::appdata().string() + "/sunshine.log",  // log file
     false,  // notify_pre_releases
+    true,  // system_tray
     {},  // prep commands
   };
 
@@ -1229,6 +1230,7 @@ namespace config {
     bool_f(vars, "native_pen_touch", input.native_pen_touch);
 
     bool_f(vars, "notify_pre_releases", sunshine.notify_pre_releases);
+    bool_f(vars, "system_tray", sunshine.system_tray);
 
     int port = sunshine.port;
     int_between_f(vars, "port"s, port, {1024 + nvhttp::PORT_HTTPS, 65535 - rtsp_stream::RTSP_SETUP_PORT});
@@ -1252,6 +1254,7 @@ namespace config {
                                                                    "en_US"sv,  // English (US)
                                                                    "es"sv,  // Spanish
                                                                    "fr"sv,  // French
+                                                                   "hu"sv,  // Hungarian
                                                                    "it"sv,  // Italian
                                                                    "ja"sv,  // Japanese
                                                                    "ko"sv,  // Korean
@@ -1262,6 +1265,7 @@ namespace config {
                                                                    "sv"sv,  // Swedish
                                                                    "tr"sv,  // Turkish
                                                                    "uk"sv,  // Ukrainian
+                                                                   "vi"sv,  // Vietnamese
                                                                    "zh"sv,  // Chinese
                                                                    "zh_TW"sv,  // Chinese (Traditional)
                                                                  });
