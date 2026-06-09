@@ -81,7 +81,7 @@ namespace platf::dxgi {
    * @brief Initialize the Windows.Graphics.Capture backend.
    * @return 0 on success, -1 on failure.
    */
-  int wgc_capture_t::init(display_base_t *display, const ::video::config_t &config) {
+  int wgc_capture_t::init(ID3D11Device *device, IDXGIOutput *output, DXGI_FORMAT &capture_format, const ::video::config_t &config) {
     HRESULT status;
     dxgi::dxgi_t dxgi;
     winrt::com_ptr<::IInspectable> d3d_comhandle;
@@ -90,7 +90,7 @@ namespace platf::dxgi {
         BOOST_LOG(error) << "Screen capture is not supported on this device for this release of Windows!"sv;
         return -1;
       }
-      if (FAILED(status = display->device->QueryInterface(IID_IDXGIDevice, (void **) &dxgi))) {
+      if (FAILED(status = device->QueryInterface(IID_IDXGIDevice, (void **) &dxgi))) {
         BOOST_LOG(error) << "Failed to query DXGI interface from device [0x"sv << util::hex(status).to_string_view() << ']';
         return -1;
       }
@@ -105,7 +105,7 @@ namespace platf::dxgi {
 
     DXGI_OUTPUT_DESC output_desc;
     uwp_device = d3d_comhandle.as<winrt::IDirect3DDevice>();
-    display->output->GetDesc(&output_desc);
+    output->GetDesc(&output_desc);
 
     auto monitor_factory = winrt::get_activation_factory<winrt::GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
     if (monitor_factory == nullptr ||
@@ -115,13 +115,13 @@ namespace platf::dxgi {
     }
 
     if (config.dynamicRange) {
-      display->capture_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+      capture_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     } else {
-      display->capture_format = DXGI_FORMAT_B8G8R8A8_UNORM;
+      capture_format = DXGI_FORMAT_B8G8R8A8_UNORM;
     }
 
     try {
-      frame_pool = winrt::Direct3D11CaptureFramePool::CreateFreeThreaded(uwp_device, static_cast<winrt::Windows::Graphics::DirectX::DirectXPixelFormat>(display->capture_format), 2, item.Size());
+      frame_pool = winrt::Direct3D11CaptureFramePool::CreateFreeThreaded(uwp_device, static_cast<winrt::Windows::Graphics::DirectX::DirectXPixelFormat>(capture_format), 2, item.Size());
       capture_session = frame_pool.CreateCaptureSession(item);
       frame_pool.FrameArrived({this, &wgc_capture_t::on_frame_arrived});
     } catch (winrt::hresult_error &e) {
@@ -238,7 +238,7 @@ namespace platf::dxgi {
   }
 
   int display_wgc_ram_t::init(const ::video::config_t &config, const std::string &display_name) {
-    if (display_base_t::init(config, display_name) || dup.init(this, config)) {
+    if (display_base_t::init(config, display_name) || dup.init(device.get(), output.get(), capture_format, config)) {
       return -1;
     }
 

@@ -1023,10 +1023,20 @@ namespace platf {
 
     if (config::video.capture == "wgc" || config::video.capture.empty()) {
       if (hwdevice_type == mem_type_e::dxgi) {
-        auto disp = std::make_shared<dxgi::display_wgc_vram_t>();
+        if (is_running_as_system()) {
+          // Under the service we run as SYSTEM, where in-process WGC activation fails.
+          // Capture via a helper process running as the logged-on user instead.
+          auto disp = std::make_shared<dxgi::display_wgc_helper_vram_t>();
 
-        if (!disp->init(config, display_name)) {
-          return disp;
+          if (!disp->init(config, display_name)) {
+            return disp;
+          }
+        } else {
+          auto disp = std::make_shared<dxgi::display_wgc_vram_t>();
+
+          if (!disp->init(config, display_name)) {
+            return disp;
+          }
         }
       } else if (hwdevice_type == mem_type_e::system) {
         auto disp = std::make_shared<dxgi::display_wgc_ram_t>();

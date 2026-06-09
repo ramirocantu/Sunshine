@@ -47,6 +47,7 @@
 #include "src/platform/common.h"
 #include "src/utility.h"
 #include "utf_utils.h"
+#include "wgc_ipc.h"
 
 // UDP_SEND_MSG_SIZE was added in the Windows 10 20H1 SDK
 #ifndef UDP_SEND_MSG_SIZE
@@ -558,6 +559,106 @@ namespace platf {
     }
 
     return startup_info;
+  }
+
+  HANDLE launch_wgc_helper(const std::wstring &args, HANDLE &job_out) {
+    job_out = nullptr;
+
+    // This crosses identity from SYSTEM to the logged-on user, so it only applies when
+    // we are actually running as SYSTEM (i.e., under the service).
+    if (!is_running_as_system()) {
+      BOOST_LOG(error) << "launch_wgc_helper called while not running as SYSTEM"sv;
+      return nullptr;
+    }
+
+    HANDLE user_token = retrieve_users_token(false);
+    if (!user_token) {
+      BOOST_LOG(error) << "WGC helper: no active user session token available"sv;
+      return nullptr;
+    }
+    auto close_token = util::fail_guard([user_token]() {
+      CloseHandle(user_token);
+    });
+
+    // Kill-on-close job so the helper dies if Sunshine exits or crashes, mirroring the
+    // SunshineSvc -> Sunshine.exe relationship in tools/sunshinesvc.cpp.
+    HANDLE job = CreateJobObjectW(nullptr, nullptr);
+    if (job) {
+      JOBOBJECT_EXTENDED_LIMIT_INFORMATION job_limit_info = {};
+      job_limit_info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+      SetInformationJobObject(job, JobObjectExtendedLimitInformation, &job_limit_info, sizeof(job_limit_info));
+    }
+
+    std::error_code ec;
+    STARTUPINFOEXW startup_info = create_startup_info(nullptr, job ? &job : nullptr, ec);
+    auto free_attr_list = util::fail_guard([&]() {
+      if (startup_info.lpAttributeList) {
+        free_proc_thread_attr_list(startup_info.lpAttributeList);
+      }
+    });
+    if (ec) {
+      if (job) {
+        CloseHandle(job);
+      }
+      return nullptr;
+    }
+
+    // WGC reaches into the session's DWM, which is bound to the interactive desktop.
+    startup_info.StartupInfo.lpDesktop = (LPWSTR) L"winsta0\\default";
+
+    wchar_t exe_path[MAX_PATH];
+    GetModuleFileNameW(nullptr, exe_path, ARRAYSIZE(exe_path));
+    std::wstring cmd = L"\"" + std::wstring(exe_path) + L"\" --wgc-capture-helper " + args;
+
+    PROCESS_INFORMATION process_info = {};
+    BOOL created = FALSE;
+    // CREATE_SUSPENDED so we can be certain the process is in the job before it runs.
+    DWORD creation_flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW | CREATE_SUSPENDED;
+    ec = impersonate_current_user(user_token, [&]() {
+      created = CreateProcessAsUserW(user_token, nullptr, cmd.data(), nullptr, nullptr, FALSE, creation_flags, nullptr, nullptr, (LPSTARTUPINFOW) &startup_info, &process_info);
+    });
+    if (ec || !created) {
+      BOOST_LOG(error) << "WGC helper: CreateProcessAsUser failed: "sv << GetLastError();
+      if (job) {
+        CloseHandle(job);
+      }
+      return nullptr;
+    }
+
+    ResumeThread(process_info.hThread);
+    CloseHandle(process_info.hThread);
+
+    job_out = job;
+    return process_info.hProcess;
+  }
+
+  HANDLE create_wgc_helper_pipe(const std::wstring &pipe_name) {
+    // Grant full access to SYSTEM (this process) and to interactive-session users. The
+    // helper runs as the logged-on interactive user, whose token carries the Interactive
+    // (IU) group, so we don't need to resolve its specific SID.
+    PSECURITY_DESCRIPTOR psd = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:(A;;GA;;;SY)(A;;GA;;;IU)", SDDL_REVISION_1, &psd, nullptr)) {
+      BOOST_LOG(error) << "WGC helper: failed to build pipe security descriptor: "sv << GetLastError();
+      return INVALID_HANDLE_VALUE;
+    }
+    auto free_sd = util::fail_guard([psd]() {
+      LocalFree(psd);
+    });
+
+    SECURITY_ATTRIBUTES sa = {sizeof(sa), psd, FALSE};
+    HANDLE pipe = CreateNamedPipeW(
+      pipe_name.c_str(),
+      PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+      PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+      1,  // single instance
+      dxgi::WGC_IPC_MAX_MSG,
+      dxgi::WGC_IPC_MAX_MSG,
+      0,
+      &sa);
+    if (pipe == INVALID_HANDLE_VALUE) {
+      BOOST_LOG(error) << "WGC helper: CreateNamedPipe failed: "sv << GetLastError();
+    }
+    return pipe;
   }
 
   /**
