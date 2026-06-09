@@ -18,6 +18,7 @@
 #include "src/platform/common.h"
 #include "src/utility.h"
 #include "src/video.h"
+#include "wgc_ipc.h"
 
 namespace platf::dxgi {
   extern const char *format_str[];
@@ -358,7 +359,7 @@ namespace platf::dxgi {
     wgc_capture_t();
     ~wgc_capture_t();
 
-    int init(display_base_t *display, const ::video::config_t &config);
+    int init(ID3D11Device *device, IDXGIOutput *output, DXGI_FORMAT &capture_format, const ::video::config_t &config);
     capture_e next_frame(std::chrono::milliseconds timeout, ID3D11Texture2D **out, uint64_t &out_time);
     capture_e release_frame();
     int set_cursor_visible(bool);
@@ -383,6 +384,48 @@ namespace platf::dxgi {
     wgc_capture_t dup;
 
   public:
+    int init(const ::video::config_t &config, const std::string &display_name);
+    capture_e snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor_visible) override;
+    capture_e release_snapshot() override;
+  };
+
+  /**
+   * Display backend that uses Windows.Graphics.Capture via a helper process running as
+   * the logged-on user. Used when Sunshine runs as a SYSTEM service, where in-process
+   * WGC activation fails. The helper captures into shared textures consumed here.
+   *
+   * Milestone 1: init() only launches the helper and validates that WGC works in the
+   * user session, then returns failure (the shared-texture/IPC bridge is not yet built).
+   */
+  class display_wgc_helper_vram_t: public display_vram_t {
+    HANDLE helper_proc = nullptr;  ///< user-session capture helper process
+    HANDLE helper_job = nullptr;  ///< kill-on-close job owning the helper
+    HANDLE pipe = INVALID_HANDLE_VALUE;  ///< control pipe (server end)
+    HANDLE frame_event = nullptr;  ///< frame-ready event (duplicated from helper)
+    HANDLE state_mapping = nullptr;  ///< shared state mapping (duplicated from helper)
+    wgc_shared_frame_state_t *shared_state = nullptr;  ///< mapped view of the shared state
+    device1_t device1;  ///< our device, for OpenSharedResource1
+    std::vector<texture2d_t> slot_textures;  ///< helper's shared textures opened here
+    std::vector<keyed_mutex_t> slot_mutexes;  ///< keyed mutex per slot
+    uint32_t slot_count = 0;
+    bool last_cursor_visible = true;
+
+    /**
+     * @brief Launch the helper, create the pipe, and complete the handshake: open the
+     *        shared textures, event, and state mapping. Populates the members above.
+     * @return 0 on success, -1 on failure.
+     */
+    int connect_helper(const ::video::config_t &config);
+    void teardown();
+
+    /**
+     * @brief Send a control message (e.g. cursor visibility) to the helper over the pipe.
+     * @return true on success. Best-effort; failures are non-fatal.
+     */
+    bool send_control(wgc_msg_type_e type, const void *payload, uint32_t len);
+
+  public:
+    ~display_wgc_helper_vram_t() override;
     int init(const ::video::config_t &config, const std::string &display_name);
     capture_e snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor_visible) override;
     capture_e release_snapshot() override;

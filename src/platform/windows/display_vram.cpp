@@ -29,6 +29,10 @@ extern "C" {
 #include "src/nvenc/nvenc_utils.h"
 #include "src/video.h"
 #include "utf_utils.h"
+#include "wgc_ipc.h"
+
+// standard includes
+#include <cstring>
 
 #if !defined(SUNSHINE_SHADERS_DIR)  // for testing this needs to be defined in cmake as we don't do an install
   #define SUNSHINE_SHADERS_DIR SUNSHINE_ASSETS_DIR "/shaders/directx"
@@ -1701,11 +1705,310 @@ namespace platf::dxgi {
   }
 
   int display_wgc_vram_t::init(const ::video::config_t &config, const std::string &display_name) {
-    if (display_base_t::init(config, display_name) || dup.init(this, config)) {
+    if (display_base_t::init(config, display_name) || dup.init(device.get(), output.get(), capture_format, config)) {
       return -1;
     }
 
     return 0;
+  }
+
+  void display_wgc_helper_vram_t::teardown() {
+    if (pipe != nullptr && pipe != INVALID_HANDLE_VALUE) {
+      CloseHandle(pipe);  // closing breaks the helper's pipe, so it exits
+      pipe = INVALID_HANDLE_VALUE;
+    }
+    slot_mutexes.clear();
+    slot_textures.clear();
+    slot_count = 0;
+    if (shared_state) {
+      UnmapViewOfFile(shared_state);
+      shared_state = nullptr;
+    }
+    if (state_mapping) {
+      CloseHandle(state_mapping);
+      state_mapping = nullptr;
+    }
+    if (frame_event) {
+      CloseHandle(frame_event);
+      frame_event = nullptr;
+    }
+    if (helper_proc) {
+      CloseHandle(helper_proc);
+      helper_proc = nullptr;
+    }
+    if (helper_job) {
+      CloseHandle(helper_job);  // kill-on-close backstop in case the helper is still alive
+      helper_job = nullptr;
+    }
+    device1.reset();
+  }
+
+  display_wgc_helper_vram_t::~display_wgc_helper_vram_t() {
+    teardown();
+  }
+
+  int display_wgc_helper_vram_t::connect_helper(const ::video::config_t &config) {
+    // We need ID3D11Device1 to open the helper's shared textures.
+    if (FAILED(device->QueryInterface(__uuidof(ID3D11Device1), (void **) &device1))) {
+      BOOST_LOG(error) << "WGC helper: failed to query ID3D11Device1"sv;
+      return -1;
+    }
+
+    // Create the secured control pipe before launching the helper.
+    std::wstring pipe_name = L"\\\\.\\pipe\\sunshine-wgc-" +
+                             std::to_wstring(GetCurrentProcessId()) + L"-" +
+                             std::to_wstring(GetTickCount64());
+    pipe = create_wgc_helper_pipe(pipe_name);
+    if (pipe == INVALID_HANDLE_VALUE) {
+      return -1;
+    }
+
+    DXGI_ADAPTER_DESC1 adapter_desc;
+    adapter->GetDesc1(&adapter_desc);
+    DXGI_OUTPUT_DESC output_desc;
+    output->GetDesc(&output_desc);
+    std::wstring args =
+      L"--luid-hi " + std::to_wstring(adapter_desc.AdapterLuid.HighPart) +
+      L" --luid-lo " + std::to_wstring(adapter_desc.AdapterLuid.LowPart) +
+      L" --output-name " + std::wstring(output_desc.DeviceName) +
+      L" --dynamic-range " + std::to_wstring(config.dynamicRange) +
+      L" --framerate " + std::to_wstring(config.framerate) +
+      L" --slot-count " + std::to_wstring(WGC_SLOT_COUNT) +
+      L" --pipe-name " + pipe_name;
+
+    helper_proc = launch_wgc_helper(args, helper_job);
+    if (!helper_proc) {
+      return -1;
+    }
+
+    HANDLE io_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!io_event) {
+      return -1;
+    }
+    auto close_io = util::fail_guard([&]() {
+      CloseHandle(io_event);
+    });
+
+    // Wait for the helper to connect, bounded by a timeout and the helper's liveness.
+    {
+      OVERLAPPED ov = {};
+      ov.hEvent = io_event;
+      BOOL ok = ConnectNamedPipe(pipe, &ov);
+      DWORD e = GetLastError();
+      if (!ok && e == ERROR_IO_PENDING) {
+        HANDLE waits[2] = {io_event, helper_proc};
+        if (WaitForMultipleObjects(2, waits, FALSE, 10000) != WAIT_OBJECT_0) {
+          BOOST_LOG(error) << "WGC helper: pipe connect timed out or helper exited"sv;
+          CancelIoEx(pipe, &ov);
+          return -1;
+        }
+        DWORD ignored;
+        if (!GetOverlappedResult(pipe, &ov, &ignored, FALSE)) {
+          return -1;
+        }
+      } else if (!ok && e != ERROR_PIPE_CONNECTED) {
+        BOOST_LOG(error) << "WGC helper: ConnectNamedPipe failed: "sv << e;
+        return -1;
+      }
+    }
+
+    // Read one pipe message into msgbuf, bounded by timeout + helper liveness.
+    uint8_t msgbuf[WGC_IPC_MAX_MSG];
+    auto read_msg = [&]() -> wgc_msg_header_t * {
+      ResetEvent(io_event);
+      OVERLAPPED ov = {};
+      ov.hEvent = io_event;
+      DWORD bytes = 0;
+      BOOL ok = ReadFile(pipe, msgbuf, sizeof(msgbuf), &bytes, &ov);
+      if (!ok && GetLastError() == ERROR_IO_PENDING) {
+        HANDLE waits[2] = {io_event, helper_proc};
+        if (WaitForMultipleObjects(2, waits, FALSE, 10000) != WAIT_OBJECT_0) {
+          CancelIoEx(pipe, &ov);
+          return nullptr;
+        }
+        if (!GetOverlappedResult(pipe, &ov, &bytes, FALSE)) {
+          return nullptr;
+        }
+      } else if (!ok) {
+        return nullptr;
+      }
+      if (bytes < sizeof(wgc_msg_header_t)) {
+        return nullptr;
+      }
+      auto *h = (wgc_msg_header_t *) msgbuf;
+      if (h->magic != WGC_IPC_MAGIC) {
+        return nullptr;
+      }
+      return h;
+    };
+
+    auto *h = read_msg();
+    if (!h || h->type != (uint32_t) wgc_msg_type_e::handshake || h->payload_len < sizeof(wgc_handshake_payload_t)) {
+      BOOST_LOG(error) << "WGC helper: invalid handshake"sv;
+      return -1;
+    }
+    wgc_handshake_payload_t hp;
+    std::memcpy(&hp, msgbuf + sizeof(wgc_msg_header_t), sizeof(hp));
+    slot_count = hp.slot_count;
+    if (slot_count == 0 || slot_count > 8) {
+      return -1;
+    }
+    capture_format = (DXGI_FORMAT) hp.dxgi_format;
+    if ((int) hp.width != width_before_rotation || (int) hp.height != height_before_rotation) {
+      BOOST_LOG(warning) << "WGC helper: capture size "sv << hp.width << 'x' << hp.height
+                         << " differs from expected "sv << width_before_rotation << 'x' << height_before_rotation;
+    }
+
+    if (!DuplicateHandle(helper_proc, (HANDLE) (uintptr_t) hp.event_handle, GetCurrentProcess(), &frame_event, 0, FALSE, DUPLICATE_SAME_ACCESS) ||
+        !DuplicateHandle(helper_proc, (HANDLE) (uintptr_t) hp.mapping_handle, GetCurrentProcess(), &state_mapping, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+      BOOST_LOG(error) << "WGC helper: failed to duplicate event/mapping handles"sv;
+      return -1;
+    }
+    shared_state = (wgc_shared_frame_state_t *) MapViewOfFile(state_mapping, FILE_MAP_READ, 0, 0, sizeof(wgc_shared_frame_state_t));
+    if (!shared_state) {
+      return -1;
+    }
+
+    slot_textures.resize(slot_count);
+    slot_mutexes.resize(slot_count);
+    for (uint32_t i = 0; i < slot_count; ++i) {
+      auto *sh = read_msg();
+      if (!sh || sh->type != (uint32_t) wgc_msg_type_e::slot_handle || sh->payload_len < sizeof(wgc_slot_handle_payload_t)) {
+        BOOST_LOG(error) << "WGC helper: invalid slot handle message"sv;
+        return -1;
+      }
+      wgc_slot_handle_payload_t sp;
+      std::memcpy(&sp, msgbuf + sizeof(wgc_msg_header_t), sizeof(sp));
+      if (sp.slot_index >= slot_count) {
+        return -1;
+      }
+      HANDLE dup_tex = nullptr;
+      if (!DuplicateHandle(helper_proc, (HANDLE) (uintptr_t) sp.texture_handle, GetCurrentProcess(), &dup_tex, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        return -1;
+      }
+      HRESULT s = device1->OpenSharedResource1(dup_tex, __uuidof(ID3D11Texture2D), (void **) &slot_textures[sp.slot_index]);
+      CloseHandle(dup_tex);
+      if (FAILED(s)) {
+        BOOST_LOG(error) << "WGC helper: OpenSharedResource1 failed [0x"sv << util::hex(s).to_string_view() << ']';
+        return -1;
+      }
+      if (FAILED(slot_textures[sp.slot_index]->QueryInterface(__uuidof(IDXGIKeyedMutex), (void **) &slot_mutexes[sp.slot_index]))) {
+        return -1;
+      }
+    }
+
+    BOOST_LOG(info) << "WGC helper: handshake complete ("sv << slot_count << " slots, "sv
+                    << hp.width << 'x' << hp.height << ", format "sv << (int) capture_format << ')';
+    return 0;
+  }
+
+  int display_wgc_helper_vram_t::init(const ::video::config_t &config, const std::string &display_name) {
+    if (display_base_t::init(config, display_name)) {
+      return -1;
+    }
+    if (connect_helper(config)) {
+      teardown();
+      return -1;
+    }
+    return 0;
+  }
+
+  bool display_wgc_helper_vram_t::send_control(wgc_msg_type_e type, const void *payload, uint32_t len) {
+    if (pipe == nullptr || pipe == INVALID_HANDLE_VALUE) {
+      return false;
+    }
+    uint8_t buf[WGC_IPC_MAX_MSG];
+    auto *h = (wgc_msg_header_t *) buf;
+    h->magic = WGC_IPC_MAGIC;
+    h->type = (uint32_t) type;
+    h->payload_len = len;
+    if (len) {
+      std::memcpy(buf + sizeof(*h), payload, len);
+    }
+    OVERLAPPED ov = {};
+    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!ov.hEvent) {
+      return false;
+    }
+    DWORD written = 0;
+    BOOL ok = WriteFile(pipe, buf, sizeof(*h) + len, &written, &ov);
+    if (!ok && GetLastError() == ERROR_IO_PENDING) {
+      if (WaitForSingleObject(ov.hEvent, 1000) == WAIT_OBJECT_0) {
+        ok = GetOverlappedResult(pipe, &ov, &written, FALSE);
+      } else {
+        CancelIoEx(pipe, &ov);
+        ok = FALSE;
+      }
+    }
+    CloseHandle(ov.hEvent);
+    return ok && written == sizeof(*h) + len;
+  }
+
+  capture_e display_wgc_helper_vram_t::snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor_visible) {
+    // Forward cursor visibility changes to the helper (best-effort).
+    if (cursor_visible != last_cursor_visible) {
+      wgc_set_cursor_payload_t cp {cursor_visible ? 1u : 0u};
+      send_control(wgc_msg_type_e::set_cursor_visible, &cp, sizeof(cp));
+      last_cursor_visible = cursor_visible;
+    }
+
+    // Wait for the helper to publish a frame, or notice it exited.
+    HANDLE waits[2] = {frame_event, helper_proc};
+    DWORD w = WaitForMultipleObjects(2, waits, FALSE, (DWORD) timeout.count());
+    if (w == WAIT_TIMEOUT) {
+      return capture_e::timeout;
+    }
+    if (w == WAIT_OBJECT_0 + 1) {
+      BOOST_LOG(warning) << "WGC helper: capture helper exited; reinitializing"sv;
+      return capture_e::reinit;
+    }
+    if (w != WAIT_OBJECT_0) {
+      return capture_e::error;
+    }
+
+    if (!shared_state || shared_state->producer_alive == 0) {
+      BOOST_LOG(warning) << "WGC helper: capture helper stopped producing; reinitializing"sv;
+      return capture_e::reinit;
+    }
+
+    int32_t slot = shared_state->latest_slot;
+    if (slot < 0 || (uint32_t) slot >= slot_count) {
+      return capture_e::timeout;  // spurious wakeup / not ready yet
+    }
+    uint64_t frame_qpc = (uint64_t) shared_state->frame_qpc;
+    auto frame_timestamp = std::chrono::steady_clock::now() - qpc_time_difference(qpc_counter(), frame_qpc);
+
+    std::shared_ptr<platf::img_t> img;
+    if (!pull_free_image_cb(img)) {
+      return capture_e::interrupted;
+    }
+    auto d3d_img = std::static_pointer_cast<img_d3d_t>(img);
+    d3d_img->blank = false;
+    if (complete_img(d3d_img.get(), false) != 0) {
+      return capture_e::error;
+    }
+
+    // Lock order: the helper's slot mutex first, then the image's capture mutex (shared
+    // with the encoder). Both are released by RAII on every return path below.
+    texture_lock_helper slot_lock(slot_mutexes[slot].get());
+    if (!slot_lock.lock()) {
+      BOOST_LOG(error) << "WGC helper: failed to lock slot texture"sv;
+      return capture_e::error;
+    }
+    texture_lock_helper img_lock(d3d_img->capture_mutex.get());
+    if (!img_lock.lock()) {
+      BOOST_LOG(error) << "WGC helper: failed to lock capture texture"sv;
+      return capture_e::error;
+    }
+    device_ctx->CopyResource(d3d_img->capture_texture.get(), slot_textures[slot].get());
+
+    img_out = img;
+    img_out->frame_timestamp = frame_timestamp;
+    return capture_e::ok;
+  }
+
+  capture_e display_wgc_helper_vram_t::release_snapshot() {
+    return capture_e::ok;
   }
 
   std::shared_ptr<platf::img_t> display_vram_t::alloc_img() {

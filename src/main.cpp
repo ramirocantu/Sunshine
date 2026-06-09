@@ -31,6 +31,10 @@ extern "C" {
 #include "rswrapper.h"
 }
 
+#ifdef _WIN32
+  #include "platform/windows/wgc_helper.h"
+#endif
+
 using namespace std::literals;
 
 std::map<int, std::function<void()>> signal_handlers;
@@ -59,6 +63,9 @@ std::map<std::string_view, std::function<int(const char *name, int argc, char **
 #ifdef _WIN32
   {"restore-nvprefs-undo"sv, [](const char *name, int argc, char **argv) {
      return args::restore_nvprefs_undo();
+   }},
+  {"wgc-capture-helper"sv, [](const char *name, int argc, char **argv) {
+     return platf::dxgi::run_wgc_capture_helper(argc, argv);
    }},
 #endif
 };
